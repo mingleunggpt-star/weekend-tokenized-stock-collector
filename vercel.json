@@ -1,0 +1,16 @@
+{
+  "crons": [
+    {
+      "path": "/api/collect?slot=friday-close",
+      "schedule": "15 22 * * 5"
+    },
+    {
+      "path": "/api/collect?slot=saturday-evening",
+      "schedule": "0 12 * * 6"
+    },
+    {
+      "path": "/api/collect?slot=sunday-evening",
+      "schedule": "0 12 * * 0"
+    }
+  ]
+}
