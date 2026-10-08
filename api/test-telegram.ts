@@ -175,70 +175,19 @@ async function bybit(stock:Stock) {
   return {platform:"Bybit",symbol,price:n(d.lastPrice),bid:n(d.bid1Price),ask:n(d.ask1Price),vol:n(d.turnover24h??d.volume24h),hi:n(d.highPrice24h),lo:n(d.lowPrice24h)};
 }
 
-async function collectRows():Promise<Row[]> {
-  const t=nowHkt(); const rows:Row[]=[];
-  for(const stock of STOCKS){
-    const close=await fridayClose(stock);
-    for(const source of [okx,bybit]){
-      try{
-        const d=await source(stock);
-        rows.push({
-          timestamp_hkt:t.timestamp,date:t.date,day:t.day,platform:d.platform,stock,
-          token_symbol:d.symbol,friday_close:close?.toString()??"",
-          token_price:d.price?.toString()??"",bid:d.bid?.toString()??"",ask:d.ask?.toString()??"",
-          spread_pct:spread(d.bid,d.ask),volume_24h:d.vol?.toString()??"",
-          high_24h:d.hi?.toString()??"",low_24h:d.lo?.toString()??"",
-          vs_friday_pct:vsFriday(d.price,close),run_id:t.runId,
-          data_status:d.price==null?"PRICE_MISSING":close==null?"FRIDAY_CLOSE_MISSING":"OK"
-        });
-      }catch(e:any){
-        const platform=source===okx?"OKX":"Bybit";
-        const symbol=platform==="OKX"?`X${stock}-USDT`:`${stock}XUSDT`;
-        rows.push({
-          timestamp_hkt:t.timestamp,date:t.date,day:t.day,platform,stock,token_symbol:symbol,
-          friday_close:close?.toString()??"",token_price:"",bid:"",ask:"",spread_pct:"",
-          volume_24h:"",high_24h:"",low_24h:"",vs_friday_pct:"",run_id:t.runId,
-          data_status:`FETCH_ERROR:${String(e?.message??e)}`.slice(0,120)
-        });
-      }
-    }
-  }
-  return rows;
-}
-
-function summary(rows:Row[]){
-  const t=nowHkt(); const lines=[`Weekend Tokenized Stocks — ${t.timestamp} HKT`,""];
-  for(const stock of STOCKS){
-    const a=rows.filter(r=>r.stock===stock);
-    const r=a.find(x=>x.data_status==="OK")??a[0];
-    if(!r){lines.push(`${stock} — NO_DATA`);continue;}
-    lines.push(`${stock} | ${r.platform} | px ${r.token_price||"-"} | vs Fri ${r.vs_friday_pct?`${r.vs_friday_pct}%`:"-"} | vol ${r.volume_24h||"-"} | spread ${r.spread_pct?`${r.spread_pct}%`:"-"} | ${r.data_status}`);
-  }
-  lines.push("","Raw market data only — no forecast.");
-  return lines.join("\n");
-}
-
 export default async function handler(req:VercelRequest,res:VercelResponse){
   if(!authOk(req)) return res.status(401).json({ok:false,error:"Unauthorized"});
   const t=nowHkt();
   try{
-    const fresh=await collectRows();
-    const loaded=await driveLoad();
-    const merged=dedupe([...loaded.rows,...fresh]);
-    const masterCsv=rowsToCsv(merged);
-    const fileId=await driveSave(loaded.fileId,loaded.folder,masterCsv);
-    const text=summary(fresh);
+    const text=`✅ Telegram connection test\n\nTime: ${t.timestamp} HKT\nRun ID: ${t.runId}\n\nRaw market data only — no forecast.`;
     const zip=new JSZip();
-    zip.file(`latest_run_${t.runId}.csv`,rowsToCsv(fresh));
-    zip.file("Weekend_Tokenized_Stocks_master.csv",masterCsv);
-    zip.file(`telegram_summary_${t.runId}.txt`,text);
-    zip.file(`run_${t.runId}.json`,JSON.stringify({run_id:t.runId,timestamp_hkt:t.timestamp,rows:fresh.length},null,2));
-    const bytes=new Uint8Array(await zip.generateAsync({type:"uint8array",compression:"DEFLATE"}));
+    zip.file("telegram_test.txt",text);
+    const bytes=new Uint8Array(await zip.generateAsync({type:"uint8array"}));
     await tgMessage(text);
-    await tgZip(bytes,`Weekend_Tokenized_Stocks_${t.runId}.zip`,"Weekend Tokenized Stocks data package");
-    return res.status(200).json({ok:true,run_id:t.runId,rows_collected:fresh.length,master_rows:merged.length,drive_file_id:fileId,telegram_sent:true});
+    await tgZip(bytes,`telegram_test_${t.runId}.zip`,"Telegram test package");
+    return res.status(200).json({ok:true,test:"telegram",message_sent:true,zip_sent:true,run_id:t.runId});
   }catch(e:any){
     console.error(e);
-    return res.status(500).json({ok:false,run_id:t.runId,error:String(e?.message??e)});
+    return res.status(500).json({ok:false,test:"telegram",error:String(e?.message??e)});
   }
 }
