@@ -144,36 +144,45 @@ async function driveSave(fileId:string,folder:string,csv:string) {
 
 type FridayCloseResult = { value:number|null; source:string };
 
-function compactDate(d:Date) {
-  const y=d.getUTCFullYear();
-  const m=String(d.getUTCMonth()+1).padStart(2,"0");
-  const day=String(d.getUTCDate()).padStart(2,"0");
-  return `${y}${m}${day}`;
+function nyWeekday(ts:number) {
+  return new Intl.DateTimeFormat("en-US", {
+    timeZone:"America/New_York", weekday:"short"
+  }).format(new Date(ts*1000));
 }
 
-async function stooqFridayClose(stock:Stock):Promise<FridayCloseResult> {
-  try {
-    const end=new Date();
-    const start=new Date(end.getTime()-21*24*60*60*1000);
-    const u=new URL("https://stooq.com/q/d/l/");
-    u.searchParams.set("s",`${stock.toLowerCase()}.us`);
-    u.searchParams.set("d1",compactDate(start));
-    u.searchParams.set("d2",compactDate(end));
-    u.searchParams.set("i","d");
-    const r=await fetch(u,{headers:{"user-agent":"Mozilla/5.0"}});
-    if(!r.ok) return {value:null,source:""};
-    const txt=await r.text();
-    const lines=txt.trim().split(/\r?\n/).slice(1).filter(Boolean);
-    for(let i=lines.length-1;i>=0;i--){
-      const [date,,,,close]=lines[i].split(",");
-      if(!date) continue;
-      const d=new Date(`${date}T12:00:00Z`);
-      if(d.getUTCDay()===5){
-        const c=n(close);
-        if(c!=null) return {value:c,source:"STOOQ"};
+async function yahooFridayClose(stock:Stock):Promise<FridayCloseResult> {
+  // Yahoo chart is an unofficial endpoint. Use only as a lightweight fallback source.
+  // Try query1 then query2; do not retry aggressively.
+  for (const host of ["query1.finance.yahoo.com","query2.finance.yahoo.com"]) {
+    try {
+      const u=new URL(`https://${host}/v8/finance/chart/${encodeURIComponent(stock)}`);
+      u.searchParams.set("range","1mo");
+      u.searchParams.set("interval","1d");
+      u.searchParams.set("includePrePost","false");
+      u.searchParams.set("events","div,splits");
+
+      const r=await fetch(u,{
+        headers:{
+          "accept":"application/json",
+          "user-agent":"WeekendTokenizedStockCollector/2.1"
+        }
+      });
+      if(!r.ok) continue;
+
+      const j:any=await r.json();
+      const result=j?.chart?.result?.[0];
+      const timestamps:any[]=Array.isArray(result?.timestamp)?result.timestamp:[];
+      const closes:any[]=Array.isArray(result?.indicators?.quote?.[0]?.close)
+        ? result.indicators.quote[0].close : [];
+
+      for(let i=Math.min(timestamps.length,closes.length)-1;i>=0;i--){
+        const ts=n(timestamps[i]);
+        const c=n(closes[i]);
+        if(ts==null||c==null) continue;
+        if(nyWeekday(ts)==="Fri") return {value:c,source:"YAHOO_UNOFFICIAL"};
       }
-    }
-  } catch {}
+    } catch {}
+  }
   return {value:null,source:""};
 }
 
@@ -202,9 +211,8 @@ async function twelveFridayClose(stock:Stock):Promise<FridayCloseResult> {
 }
 
 async function fridayClose(stock:Stock):Promise<FridayCloseResult> {
-  // Stooq first avoids exhausting low Twelve Data API-credit limits.
-  const stooq=await stooqFridayClose(stock);
-  if(stooq.value!=null) return stooq;
+  const yahoo=await yahooFridayClose(stock);
+  if(yahoo.value!=null) return yahoo;
   return await twelveFridayClose(stock);
 }
 
@@ -299,11 +307,11 @@ export default async function handler(req:VercelRequest,res:VercelResponse){
     zip.file("Weekend_Tokenized_Stocks_master.csv",masterCsv);
     zip.file(`telegram_summary_${t.runId}.txt`,text);
     const status_counts=Object.fromEntries([...new Set(fresh.map(r=>r.data_status))].map(k=>[k,fresh.filter(r=>r.data_status===k).length]));
-    zip.file(`run_${t.runId}.json`,JSON.stringify({run_id:t.runId,timestamp_hkt:t.timestamp,rows:fresh.length,status_counts},null,2));
+    zip.file(`run_${t.runId}.json`,JSON.stringify({version:"2.1",run_id:t.runId,timestamp_hkt:t.timestamp,rows:fresh.length,status_counts},null,2));
     const bytes=new Uint8Array(await zip.generateAsync({type:"uint8array",compression:"DEFLATE"}));
     await tgMessage(text);
     await tgZip(bytes,`Weekend_Tokenized_Stocks_${t.runId}.zip`,"Weekend Tokenized Stocks data package");
-    return res.status(200).json({ok:true,run_id:t.runId,rows_collected:fresh.length,master_rows:merged.length,drive_file_id:fileId,telegram_sent:true,status_counts});
+    return res.status(200).json({ok:true,version:"2.1",run_id:t.runId,rows_collected:fresh.length,master_rows:merged.length,drive_file_id:fileId,telegram_sent:true,status_counts});
   }catch(e:any){
     console.error(e);
     return res.status(500).json({ok:false,run_id:t.runId,error:String(e?.message??e)});
