@@ -8,12 +8,12 @@ type Stock = (typeof STOCKS)[number];
 
 type Row = {
   timestamp_hkt: string; date: string; day: string; platform: string; stock: string;
-  token_symbol: string; friday_close: string; token_price: string; bid: string; ask: string;
+  token_symbol: string; friday_close: string; friday_close_source: string; token_price: string; bid: string; ask: string;
   spread_pct: string; volume_24h: string; high_24h: string; low_24h: string;
   vs_friday_pct: string; run_id: string; data_status: string;
 };
 
-const HEADERS: (keyof Row)[] = ["timestamp_hkt","date","day","platform","stock","token_symbol","friday_close","token_price","bid","ask","spread_pct","volume_24h","high_24h","low_24h","vs_friday_pct","run_id","data_status"];
+const HEADERS: (keyof Row)[] = ["timestamp_hkt","date","day","platform","stock","token_symbol","friday_close","friday_close_source","token_price","bid","ask","spread_pct","volume_24h","high_24h","low_24h","vs_friday_pct","run_id","data_status"];
 
 function nowHkt() {
   const parts = Object.fromEntries(
@@ -142,21 +142,70 @@ async function driveSave(fileId:string,folder:string,csv:string) {
   return made.data.id ?? "";
 }
 
-async function fridayClose(stock:Stock):Promise<number|null> {
+type FridayCloseResult = { value:number|null; source:string };
+
+function compactDate(d:Date) {
+  const y=d.getUTCFullYear();
+  const m=String(d.getUTCMonth()+1).padStart(2,"0");
+  const day=String(d.getUTCDate()).padStart(2,"0");
+  return `${y}${m}${day}`;
+}
+
+async function stooqFridayClose(stock:Stock):Promise<FridayCloseResult> {
+  try {
+    const end=new Date();
+    const start=new Date(end.getTime()-21*24*60*60*1000);
+    const u=new URL("https://stooq.com/q/d/l/");
+    u.searchParams.set("s",`${stock.toLowerCase()}.us`);
+    u.searchParams.set("d1",compactDate(start));
+    u.searchParams.set("d2",compactDate(end));
+    u.searchParams.set("i","d");
+    const r=await fetch(u,{headers:{"user-agent":"Mozilla/5.0"}});
+    if(!r.ok) return {value:null,source:""};
+    const txt=await r.text();
+    const lines=txt.trim().split(/\r?\n/).slice(1).filter(Boolean);
+    for(let i=lines.length-1;i>=0;i--){
+      const [date,,,,close]=lines[i].split(",");
+      if(!date) continue;
+      const d=new Date(`${date}T12:00:00Z`);
+      if(d.getUTCDay()===5){
+        const c=n(close);
+        if(c!=null) return {value:c,source:"STOOQ"};
+      }
+    }
+  } catch {}
+  return {value:null,source:""};
+}
+
+async function twelveFridayClose(stock:Stock):Promise<FridayCloseResult> {
   const key=process.env.TWELVE_DATA_API_KEY;
-  if(!key) return null;
-  const u=new URL("https://api.twelvedata.com/time_series");
-  u.searchParams.set("symbol",stock); u.searchParams.set("interval","1day");
-  u.searchParams.set("outputsize","10"); u.searchParams.set("apikey",key);
-  const r=await fetch(u);
-  if(!r.ok) return null;
-  const j:any=await r.json();
-  if(!Array.isArray(j.values)) return null;
-  for(const item of j.values){
-    const d=new Date(`${item.datetime}T12:00:00Z`);
-    if(d.getUTCDay()===5){ const c=n(item.close); if(c!=null) return c; }
-  }
-  return null;
+  if(!key) return {value:null,source:""};
+  try {
+    const u=new URL("https://api.twelvedata.com/time_series");
+    u.searchParams.set("symbol",stock);
+    u.searchParams.set("interval","1day");
+    u.searchParams.set("outputsize","10");
+    u.searchParams.set("apikey",key);
+    const r=await fetch(u);
+    if(!r.ok) return {value:null,source:""};
+    const j:any=await r.json();
+    if(!Array.isArray(j.values)) return {value:null,source:""};
+    for(const item of j.values){
+      const d=new Date(`${item.datetime}T12:00:00Z`);
+      if(d.getUTCDay()===5){
+        const c=n(item.close);
+        if(c!=null) return {value:c,source:"TWELVE_DATA"};
+      }
+    }
+  } catch {}
+  return {value:null,source:""};
+}
+
+async function fridayClose(stock:Stock):Promise<FridayCloseResult> {
+  // Stooq first avoids exhausting low Twelve Data API-credit limits.
+  const stooq=await stooqFridayClose(stock);
+  if(stooq.value!=null) return stooq;
+  return await twelveFridayClose(stock);
 }
 
 async function okx(stock:Stock) {
@@ -177,30 +226,45 @@ async function bybit(stock:Stock) {
   return {platform:"Bybit",symbol,price:n(d.lastPrice),bid:n(d.bid1Price),ask:n(d.ask1Price),vol:n(d.turnover24h??d.volume24h),hi:n(d.highPrice24h),lo:n(d.lowPrice24h)};
 }
 
+function classifyFetchError(platform:string,e:any){
+  const msg=String(e?.message??e);
+  if(platform==="Bybit" && /\bHTTP 403\b/.test(msg)) return "VENUE_ACCESS_BLOCKED_403";
+  if(/\bHTTP 404\b/.test(msg)) return "SYMBOL_NOT_FOUND";
+  if(/\bHTTP 400\b/.test(msg)) return "SYMBOL_NOT_FOUND_OR_BAD_REQUEST";
+  if(/no data/i.test(msg)) return "MARKET_DATA_MISSING";
+  return `FETCH_ERROR:${msg}`.slice(0,120);
+}
+
 async function collectRows():Promise<Row[]> {
   const t=nowHkt(); const rows:Row[]=[];
   for(const stock of STOCKS){
-    const close=await fridayClose(stock);
+    const closeInfo=await fridayClose(stock);
+    const close=closeInfo.value;
     for(const source of [okx,bybit]){
       try{
         const d=await source(stock);
+        let status="OK";
+        if(d.price==null) status="MARKET_DATA_MISSING";
+        else if(close==null) status="MARKET_OK_FRIDAY_CLOSE_MISSING";
         rows.push({
           timestamp_hkt:t.timestamp,date:t.date,day:t.day,platform:d.platform,stock,
           token_symbol:d.symbol,friday_close:close?.toString()??"",
+          friday_close_source:closeInfo.source,
           token_price:d.price?.toString()??"",bid:d.bid?.toString()??"",ask:d.ask?.toString()??"",
           spread_pct:spread(d.bid,d.ask),volume_24h:d.vol?.toString()??"",
           high_24h:d.hi?.toString()??"",low_24h:d.lo?.toString()??"",
           vs_friday_pct:vsFriday(d.price,close),run_id:t.runId,
-          data_status:d.price==null?"PRICE_MISSING":close==null?"FRIDAY_CLOSE_MISSING":"OK"
+          data_status:status
         });
       }catch(e:any){
         const platform=source===okx?"OKX":"Bybit";
         const symbol=platform==="OKX"?`X${stock}-USDT`:`${stock}XUSDT`;
         rows.push({
           timestamp_hkt:t.timestamp,date:t.date,day:t.day,platform,stock,token_symbol:symbol,
-          friday_close:close?.toString()??"",token_price:"",bid:"",ask:"",spread_pct:"",
+          friday_close:close?.toString()??"",friday_close_source:closeInfo.source,
+          token_price:"",bid:"",ask:"",spread_pct:"",
           volume_24h:"",high_24h:"",low_24h:"",vs_friday_pct:"",run_id:t.runId,
-          data_status:`FETCH_ERROR:${String(e?.message??e)}`.slice(0,120)
+          data_status:classifyFetchError(platform,e)
         });
       }
     }
@@ -212,7 +276,7 @@ function summary(rows:Row[]){
   const t=nowHkt(); const lines=[`Weekend Tokenized Stocks — ${t.timestamp} HKT`,""];
   for(const stock of STOCKS){
     const a=rows.filter(r=>r.stock===stock);
-    const r=a.find(x=>x.data_status==="OK")??a[0];
+    const r=a.find(x=>x.platform==="OKX" && x.token_price) ?? a.find(x=>x.token_price) ?? a[0];
     if(!r){lines.push(`${stock} — NO_DATA`);continue;}
     lines.push(`${stock} | ${r.platform} | px ${r.token_price||"-"} | vs Fri ${r.vs_friday_pct?`${r.vs_friday_pct}%`:"-"} | vol ${r.volume_24h||"-"} | spread ${r.spread_pct?`${r.spread_pct}%`:"-"} | ${r.data_status}`);
   }
@@ -234,11 +298,12 @@ export default async function handler(req:VercelRequest,res:VercelResponse){
     zip.file(`latest_run_${t.runId}.csv`,rowsToCsv(fresh));
     zip.file("Weekend_Tokenized_Stocks_master.csv",masterCsv);
     zip.file(`telegram_summary_${t.runId}.txt`,text);
-    zip.file(`run_${t.runId}.json`,JSON.stringify({run_id:t.runId,timestamp_hkt:t.timestamp,rows:fresh.length},null,2));
+    const status_counts=Object.fromEntries([...new Set(fresh.map(r=>r.data_status))].map(k=>[k,fresh.filter(r=>r.data_status===k).length]));
+    zip.file(`run_${t.runId}.json`,JSON.stringify({run_id:t.runId,timestamp_hkt:t.timestamp,rows:fresh.length,status_counts},null,2));
     const bytes=new Uint8Array(await zip.generateAsync({type:"uint8array",compression:"DEFLATE"}));
     await tgMessage(text);
     await tgZip(bytes,`Weekend_Tokenized_Stocks_${t.runId}.zip`,"Weekend Tokenized Stocks data package");
-    return res.status(200).json({ok:true,run_id:t.runId,rows_collected:fresh.length,master_rows:merged.length,drive_file_id:fileId,telegram_sent:true});
+    return res.status(200).json({ok:true,run_id:t.runId,rows_collected:fresh.length,master_rows:merged.length,drive_file_id:fileId,telegram_sent:true,status_counts});
   }catch(e:any){
     console.error(e);
     return res.status(500).json({ok:false,run_id:t.runId,error:String(e?.message??e)});
